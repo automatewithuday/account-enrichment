@@ -1,0 +1,707 @@
+"""Lean account enrichment: CSV of domains + target titles -> accounts.csv + people.csv.
+
+Ten steps per domain, eleven with --mobile (mail routing, firmographics, funding, company profile, tech stack, job postings, titles, people, verified email, mobile),
+each behind a credentialed provider configured in .env. Every network call is cached in .cache/calls.jsonl keyed by
+(backend, id, payload); reruns cost nothing. With database keys in .env every run also upserts companies / people / raw_responses (see schema.sql).
+"""
+import argparse
+import csv
+import re
+import hashlib
+import json
+import os
+import sys
+import time
+from pathlib import Path
+
+import httpx
+from dotenv import load_dotenv
+
+load_dotenv()
+HOST = os.getenv("GATEWAY_URL", "").rstrip("/")
+GW_KEY = os.getenv("GATEWAY_API_KEY")
+SCRAPER_TOKEN = os.getenv("SCRAPER_TOKEN")
+PHONE_KEY = os.getenv("PHONE_API_KEY")
+DEBUG = os.getenv("DEBUG") == "1"
+SB_URL = os.getenv("SUPABASE_URL", "").rstrip("/")
+SB_KEY = os.getenv("SUPABASE_SERVICE_KEY")
+try:  # provider routing: backend labels, tool ids, endpoints. Deployment config, not code (gitignored); cache keys use the configured labels so a code rename never re-bills
+    P = json.loads((Path(__file__).parent / "providers.json").read_text())
+except FileNotFoundError:
+    P = {}
+BK = lambda k: P.get("backends", {}).get(k, k)
+PHONE_URL = P.get("phone_api", "")
+GATEWAY_MAP = json.loads((Path(__file__).parent / "gateway-map.json").read_text())  # MX suffixes -> security gateway / mailbox provider
+LI_COMPANY = re.compile(r"https?://(?:[a-z]{2,3}\.)?linkedin\.com/company/([A-Za-z0-9._%-]+)", re.I)
+PRICE = {"company_search": 0.02, "email_finder": 0.34}  # credits per returned result; everything else free
+CACHE_PATH = Path(".cache/calls.jsonl")
+CACHE: dict[str, dict] = {}
+SPENT: list[tuple[str, float, bool, float]] = []  # (backend, amount, from_cache, fetched_at epoch)
+RAW: list[dict] = []  # every non-error response this run, in raw_responses row shape; cache hits included so a rerun backfills the DB
+CUR_DOMAIN = None  # ponytail: single-threaded global so cached() can stamp RAW rows with the domain being enriched
+MAX_AGE_DAYS = None  # --max-age: cached responses older than this are re-fetched (and re-billed)
+JOBS_MAX = 25  # LinkedIn postings per company, $0.001 each; jobs_total is the actor's own total, else the fetched count (integer, schema column)
+RUN_ID = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())  # per-process; also salts the gateway Idempotency-Key so a --max-age refetch is not replayed
+BATCH_TS: list[float] = []  # fetch epochs of the batched baseline/identify calls; count toward a row's freshness when it used them
+STALE_TECH_DAYS = 180  # ponytail: a technology last detected before this goes to tech_stale; tune once scoring says what "current" means
+DRY = False
+PLANNED: list[str] = []
+
+ACCOUNT_COLS = [
+    "domain", "company_source", "company_name", "linkedin_url", "linkedin_url_source", "website", "tagline", "description", "industry", "specialities", "categories", "company_type",
+    "employee_count", "employee_count_range", "headcount_growth_6m_pct", "headcount_growth_12m_pct",
+    "hq", "country", "founded_year", "revenue_estimate_low_usd", "revenue_estimate_high_usd", "linkedin_followers", "company_miss_reason", "linkedin_miss_reason",
+    "seg_vendor", "mailbox_provider", "mx_hosts", "seg_miss_reason",
+    "funding_total_usd", "last_round_type", "last_round_amount_usd", "last_round_date", "investors", "funding_source", "funding_miss_reason",
+    "tech_stack", "tech_stale", "tech_last_detected", "tech_miss_reason", "openings_count", "openings_growth_pct", "jobs_total", "jobs_newest_posted", "job_titles", "jobs_miss_reason",
+    "titles_at_company", "titles_miss_reason", "title_matches", "people_miss_reason", "source_updated_at", "data_as_of", "gateway_cr", "scraper_usd", "tech_cr", "phone_cr",
+]
+PEOPLE_COLS = ["domain", "company_name", "first_name", "last_name", "title", "linkedin_url", "source",
+               "email", "email_status", "email_catch_all", "email_domain", "mx_provider", "mx_security_gateway", "mx_gateway_type", "email_verified_at", "email_miss_reason",
+               "mobile", "mobile_cc", "mobile_status", "mobile_source", "do_not_contact", "mobile_miss_reason"]
+
+
+def log(*a):
+    if DEBUG:
+        print(*a, file=sys.stderr)
+
+
+def norm_domain(s):
+    s = (s or "").strip().lower()
+    for p in ("https://", "http://"):
+        s = s.removeprefix(p)
+    return s.removeprefix("www.").split("/")[0].split("?")[0]
+
+
+def match_titles(title, wanted):
+    t = (title or "").lower()
+    return any(w.lower() in t for w in wanted)
+
+
+def get(obj, *paths):
+    """First non-empty value at any dotted path."""
+    for path in paths:
+        cur = obj
+        for part in path.split("."):
+            cur = cur.get(part) if isinstance(cur, dict) else None
+            if cur is None:
+                break
+        if cur not in (None, "", [], {}):
+            return cur
+    return None
+
+
+def rows_of(raw, *keys):
+    """Find the list of rows in a provider payload of unknown nesting."""
+    if isinstance(raw, list):
+        return raw
+    if isinstance(raw, dict):
+        for k in keys + ("rows", "companies", "leads", "titles", "data", "output", "results", "items", "result"):
+            v = raw.get(k)
+            if isinstance(v, list):
+                return v
+            if isinstance(v, dict) and (inner := rows_of(v, *keys)):
+                return inner
+    return []
+
+
+def load_cache():
+    if CACHE_PATH.exists():
+        bad = 0
+        for line in CACHE_PATH.read_text().splitlines():
+            if line.strip():
+                try:
+                    rec = json.loads(line)
+                    CACHE[rec["key"]] = rec
+                except (ValueError, KeyError):  # ponytail: a crash mid-append leaves a truncated tail; skip it, the call just re-runs
+                    bad += 1
+        if bad:
+            print(f"cache: skipped {bad} unreadable line(s) in {CACHE_PATH}", file=sys.stderr)
+
+
+def cached(backend, ident, payload, fn):
+    key = hashlib.sha256(f"{backend}|{ident}|{json.dumps(payload, sort_keys=True, separators=(',', ':'))}".encode()).hexdigest()
+    rec = CACHE.get(key)
+    if rec and (MAX_AGE_DAYS is None or time.time() - rec.get("ts", 0) < MAX_AGE_DAYS * 86400):
+        SPENT.append((backend, rec["cost"], True, rec.get("ts", 0)))
+        RAW.append({"cache_key": key, "domain": CUR_DOMAIN, "backend": backend, "tool": ident, "payload": payload, "response": rec["resp"],
+                    "cost": rec["cost"], "fetched_at": iso(rec.get("ts", 0)), "from_cache": True})
+        return rec["resp"]
+    if DRY:
+        PLANNED.append(f"{backend}:{ident}")
+        return {"error": "dry_run"}
+    resp = fn(key)
+    cost = float(resp.pop("_cost", 0.0))
+    SPENT.append((backend, cost, False, 0 if "error" in resp else time.time()))  # a failed attempt never moves data_as_of / last_enriched_at
+    if "error" not in resp:  # errors are never cached, so a fixed key/quota just reruns
+        rec = {"key": key, "backend": backend, "id": ident, "resp": resp, "cost": cost, "ts": time.time()}
+        CACHE_PATH.parent.mkdir(exist_ok=True)
+        with CACHE_PATH.open("a") as f:
+            f.write(json.dumps(rec) + "\n")
+        CACHE[key] = rec
+        RAW.append({"cache_key": key, "domain": CUR_DOMAIN, "backend": backend, "tool": ident, "payload": payload, "response": resp,
+                    "cost": cost, "fetched_at": iso(rec["ts"]), "from_cache": False})
+    return resp
+
+
+def iso(ts):
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ts)) if ts else None
+
+
+def db_upsert(table, rows, on_conflict):
+    """Postgres REST upsert in chunks of 500; never raises, returns rows written. No-op without keys."""
+    if not (SB_URL and SB_KEY and rows):
+        return 0
+    n = 0
+    for i in range(0, len(rows), 500):
+        chunk = rows[i:i + 500]
+        r = request(f"db:{table}", "POST", f"{SB_URL}/rest/v1/{table}?on_conflict={on_conflict}", json=chunk, timeout=60,
+                    headers={"apikey": SB_KEY, "Authorization": f"Bearer {SB_KEY}", "Prefer": "resolution=merge-duplicates,return=minimal"})
+        if r is None or r.status_code >= 400:
+            print(f"db: {table} upsert failed after {n} rows: {'no response' if r is None else f'http_{r.status_code} {r.text[:200]}'}", file=sys.stderr)
+            return n
+        n += len(chunk)
+    return n
+
+
+DB_HIDE = {"company_source", "linkedin_url_source", "funding_source", "source_updated_at", "gateway_cr", "scraper_usd", "tech_cr", "phone_cr", "source", "mobile_source"}  # provider names stay in the CSVs and raw_responses, never on the demo tables
+
+
+MOBILE_COLS = ["mobile", "mobile_cc", "mobile_status", "mobile_source", "do_not_contact", "mobile_miss_reason"]
+
+
+def db_write(accounts, people, run_id, mobile=True):
+    """companies first (people/raw carry its FK), then people, then raw responses deduped by cache key. Blank strings become NULL.
+    Without --mobile the mobile columns are left out of the upsert entirely, so a plain rerun never nulls numbers or opt-out flags bought earlier.
+    People are deduped by id (one person under two input domains would otherwise hit the same key twice in one statement)."""
+    clean = lambda row: {k: (None if v == "" else v) for k, v in row.items() if k not in DB_HIDE}
+    people = list({p["id"]: p for p in people}.values())
+    nc = db_upsert("companies", [clean({k: a.get(k) for k in ACCOUNT_COLS + ["last_enriched_at"]} | {"run_id": run_id}) for a in accounts], "domain")
+    np_ = 0
+    for with_mobile in (True, False):  # two uniform groups: rows with a conclusive mobile answer carry the mobile columns, the rest leave them untouched
+        group = [p for p in people if bool(mobile and p.get("mobile_checked", True)) == with_mobile]
+        pcols = [c for c in PEOPLE_COLS if with_mobile or c not in MOBILE_COLS] + ["id", "last_enriched_at"]
+        if group:
+            np_ += db_upsert("people", [clean({k: p.get(k) for k in pcols} | {"run_id": run_id}) for p in group], "id")
+    nr = db_upsert("raw_responses", [r | {"run_id": run_id} for r in {r["cache_key"]: r for r in RAW}.values()], "cache_key")
+    return f"companies {nc}, people {np_}, raw {nr}"
+
+
+def request(label, method, url, launch=False, **kw):
+    """4 attempts on 429/409/5xx/transport errors; returns Response or None when exhausted.
+    launch=True for job launches without an idempotency key: only 429/409 (nothing was created) are retried; a 5xx or a read timeout after the
+    server accepted the job would otherwise start (and bill) a second one."""
+    for i in range(4):
+        try:
+            r = httpx.request(method, url, **kw)
+            if r.status_code not in (429, 409) and r.status_code < 500:
+                return r
+            err = f"http_{r.status_code}"
+            if launch and r.status_code >= 500:
+                log("no retry", label, err)
+                return r
+        except httpx.TransportError as e:
+            err = f"transport:{type(e).__name__}"
+            if launch:
+                log("no retry", label, err)
+                return None
+        log("retry", label, err)
+        time.sleep(2 ** i)
+    return None
+
+
+def body_json(r):
+    """Response body as JSON, or None when the provider sent something else (callers return an error, which is never cached)."""
+    try:
+        return r.json()
+    except ValueError:
+        log("bad_json", r.status_code, r.text[:200])
+        return None
+
+
+def gateway(step, payload, backend="gateway", check=None):
+    """check(raw) -> error string or None: provider-level errors inside a 200 body (quota, bad input) must surface before the cache sees them."""
+    tool = P.get("tools", {}).get(step)
+    if not tool:
+        return {"error": "no_provider_config"}
+    def fn(key):
+        if not GW_KEY:
+            return {"error": "no_gateway_key"}
+        r = request(tool, "POST", f"{HOST}/api/v2/integrations/{tool}/execute", json={"payload": payload},
+                    headers={"Authorization": f"Bearer {GW_KEY}", "Idempotency-Key": f"{key}:{RUN_ID}"}, timeout=90)
+        if r is None:
+            return {"error": "http_5xx_exhausted"}
+        if r.status_code >= 400:
+            log(tool, r.status_code, r.text[:600])
+            return {"error": f"http_{r.status_code}", "detail": r.text[:200]}
+        body = body_json(r)
+        if not isinstance(body, dict):
+            return {"error": "bad_json"}
+        raw = get(body, "toolResponse.raw", "result")
+        if raw is None:  # get() skips empty values: an empty result is a real, cacheable miss; no result field at all is the gateway's own error envelope
+            tr = body.get("toolResponse") or {}
+            if "raw" in tr or "result" in body:
+                raw = tr["raw"] if "raw" in tr else body["result"]
+            else:
+                return {"error": "no_result:" + str(body.get("error") or body.get("message") or "")[:80]}
+        if check and (err := check(raw)):
+            return {"error": err}
+        billing = body.get("billing")
+        log(tool, r.status_code, billing, json.dumps(raw)[:700])
+        cost = get(billing or {}, "credits", "creditsCharged", "credits_charged", "amount")
+        if not isinstance(cost, (int, float)):
+            cost = PRICE.get(step, 0.0) * (1 if rows_of(raw) else 0)
+        return {"raw": raw, "billing": billing, "_cost": cost}
+    return cached(BK(backend), tool, payload, fn)
+
+
+def scraper(actor_key, payload, per_item_usd, start_usd=0.001, **params):
+    actor = P.get("actors", {}).get(actor_key)
+    if not (actor and P.get("scraper_run_url")):
+        return {"error": "no_provider_config"}
+    def fn(key):
+        if not SCRAPER_TOKEN:
+            return {"error": "no_scraper_token"}
+        r = request("scraper", "POST", P["scraper_run_url"].format(actor=actor), launch=True,  # a re-launch re-bills
+                    params={"token": SCRAPER_TOKEN, "clean": "true", **params}, json=payload, timeout=320)  # the platform hard-fails sync runs at 300s
+        if r is None:
+            return {"error": "http_5xx_exhausted"}
+        if r.status_code == 408:
+            return {"error": "scraper_408_timeout"}
+        if r.status_code == 403 and "not-approved" in r.text:  # one-time approval in the platform console
+            return {"error": "scraper_actor_not_approved:" + str(get(body_json(r) or {}, "error.data.approvalUrl"))}
+        if r.status_code >= 400:
+            return {"error": f"http_{r.status_code}", "detail": r.text[:200]}
+        items = body_json(r)
+        if not isinstance(items, list):
+            return {"error": "bad_json"}
+        log("scraper", actor, r.status_code, len(items))
+        return {"items": items, "_cost": start_usd + per_item_usd * len(items)}
+    return cached(BK("scraper"), actor, payload, fn)
+
+
+def phone_finder(payload):
+    """Direct waterfall phone finder: launch one contact, poll until terminated. 10 provider credits per phone found, nothing on a miss."""
+    def fn(key):
+        if not PHONE_KEY:
+            return {"error": "no_phone_key"}
+        h = {"X-API-Key": PHONE_KEY}
+        r = request("phone", "POST", PHONE_URL, json=payload, headers=h, timeout=60, launch=True)  # no idempotency key: never re-launch blind
+        raw = {}
+        for i in range(26):  # launch + 25 polls at 5 s; 202 with no data while running, 200 + status=terminated when done; every response is inspected
+            if i:
+                time.sleep(5)
+                r = request("phone", "GET", f"{PHONE_URL}/{raw.get('id')}", headers=h, timeout=60)
+            if r is None:
+                return {"error": "http_5xx_exhausted"}
+            if r.status_code >= 400:
+                log("phone", r.status_code, r.text[:600])
+                return {"error": f"http_{r.status_code}", "detail": r.text[:200]}
+            raw = body_json(r)
+            if not isinstance(raw, dict):
+                return {"error": "bad_json"}
+            if raw.get("status") == "terminated":
+                rows = raw.get("data") or []
+                log("phone", r.status_code, json.dumps(raw)[:700])
+                return {"raw": raw, "_cost": 10 * sum(1 for x in rows if x.get("contact_phone_number"))}
+        return {"error": "async_timeout"}  # ponytail: the job id is lost here; persist it and resume if timeouts ever show up in practice
+    return cached(BK("phone"), "async", payload, fn)
+
+
+def scrape_jobs(linkedin_url, max_items=JOBS_MAX):
+    return scraper("jobs", {"company": [linkedin_url], "maxItems": max_items, "postedLimit": "month", "sortBy": "date"},
+                 per_item_usd=0.001, maxItems=max_items, maxTotalChargeUsd=0.05)
+
+
+def scrape_company(linkedin_url):
+    """LinkedIn company page scrape: the source of truth for name/industry/size/HQ. $0.004 per company."""
+    return scraper("company", {"companies": [linkedin_url]}, per_item_usd=0.004, start_usd=0.00005, maxTotalChargeUsd=0.02)
+
+
+def tech_lookup(domain):
+    """Tech names: 0.14 cr per domain, so one call per domain keeps the cache per domain."""
+    def check(raw):  # provider errors (quota, bad key) arrive inside a 200 body; surfacing them here keeps them out of the cache
+        errs = get(raw or {}, "Errors", "data.Errors")
+        if errs:
+            e = errs[0] if isinstance(errs[0], dict) else {"Message": str(errs[0])}
+            return f"tech_{e.get('Code')}_{str(e.get('Message', ''))[:40]}"
+    resp = gateway("tech", {"domains": [domain], "live_only": True, "hide_text": True,
+                                                "no_meta": True, "no_attr": True, "no_pii": True}, backend="tech", check=check)
+    if resp.get("error"):
+        return resp
+    raw = resp.get("raw") or {}
+    tech = {}
+    for res in get(raw, "Results", "data.Results") or []:
+        names = {}  # name -> LastDetected epoch ms (None when the provider gives none)
+        for path in (res.get("Result") or {}).get("Paths", []):
+            for t in path.get("Technologies", []):
+                s_ = t.get("Name", "") + (f" ({t['Tag']})" if t.get("Tag") else "")
+                if s_:
+                    names[s_] = max(names.get(s_) or 0, t.get("LastDetected") or 0) or None
+        tech[norm_domain(res.get("Lookup"))] = names
+    return {"tech": tech}
+
+
+def dns_query(domain, rtype):
+    """MX -> [(pref, host)], TXT -> [str]. Raises dns.resolver errors; caller maps them to statuses."""
+    import dns.resolver  # ponytail: lazy import keeps the module importable without the DNS dependency for the offline self-check
+    r = dns.resolver.Resolver()
+    r.lifetime = 4.0
+    ans = r.resolve(domain, rtype)
+    if rtype == "MX":
+        return sorted((a.preference, str(a.exchange).rstrip(".").lower()) for a in ans)
+    return [b"".join(a.strings).decode(errors="ignore").lower() for a in ans]
+
+
+def suffix_match(host, table, key):
+    best, best_len = None, 0
+    for name, entry in table.items():
+        for suf in entry[key]:
+            if (host == suf or host.endswith("." + suf)) and len(suf) > best_len:
+                best, best_len = name, len(suf)
+    return best
+
+
+def classify_mx(hosts, spf):
+    """Gateway = first MX host (preference order) matching a gateway suffix; mailbox from MX when direct, else from SPF include."""
+    seg = next((v for h in hosts if (v := suffix_match(h, GATEWAY_MAP["gateways"], "suffixes"))), None)
+    mx_prov = None if seg else next((p for h in hosts if (p := suffix_match(h, GATEWAY_MAP["mailbox_providers"], "mx_suffixes"))), None)
+    prov = mx_prov or next((p for p, e in GATEWAY_MAP["mailbox_providers"].items() if any(f"include:{i}" in spf for i in e["spf_includes"])), None)
+    # "none" only when the MX itself is a known mailbox host; an unmapped MX with an SPF hint is still an unidentified hop
+    return {"seg_vendor": seg or ("none" if mx_prov else "unknown"), "mailbox_provider": prov or "other", "mx_hosts": "|".join(hosts)}
+
+
+def mail_gateway(d):
+    """Free: what sits in front of the domain's inbox. nxdomain/no_mx/null_mx are definitive and cached; timeouts are errors and retried next run."""
+    def fn(key):
+        import dns.exception
+        import dns.resolver
+        try:
+            hosts = [h for _, h in dns_query(d, "MX")]
+        except dns.resolver.NXDOMAIN:
+            return {"raw": {"status": "nxdomain"}, "_cost": 0.0}
+        except dns.resolver.NoAnswer:
+            return {"raw": {"status": "no_mx"}, "_cost": 0.0}
+        except (dns.exception.Timeout, dns.resolver.NoNameservers, dns.resolver.LifetimeTimeout) as e:
+            return {"error": f"dns_{type(e).__name__.lower()}"}
+        if hosts in ([""], ["."]):
+            return {"raw": {"status": "null_mx", "mx_hosts": ""}, "_cost": 0.0}
+        try:
+            spf = next((t for t in dns_query(d, "TXT") if t.startswith("v=spf1")), "")
+        except Exception:  # SPF is a fallback signal only; any TXT failure just means "no SPF"
+            spf = ""
+        return {"raw": {"status": "ok", "spf": spf} | classify_mx(hosts, spf), "_cost": 0.0}
+    return cached("dns", "mx_lookup", {"domain": d}, fn)
+
+
+def linkedin_from_site(d):
+    """Free and precise: the company's own homepage usually links its LinkedIn page."""
+    def fn(key):
+        try:
+            r = httpx.get(f"https://{d}", follow_redirects=True, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
+        except httpx.HTTPError as e:
+            return {"error": f"site_{type(e).__name__}"}
+        if r.status_code >= 400 and r.status_code not in (404, 410):  # bot walls / outages are retried next run; a missing page is a real miss
+            return {"error": f"site_http_{r.status_code}"}
+        slugs = [m.group(1).rstrip("/").lower() for m in LI_COMPANY.finditer(r.text)] if r.status_code < 400 else []
+        return {"slug": slugs[0] if slugs else None, "status": r.status_code}
+    return cached("web", "homepage_linkedin", {"domain": d}, fn)
+
+
+def identify(domains):
+    """Free identify lookup: domain -> LinkedIn URL with a confidence score, batched."""
+    out = {}
+    for i in range(0, len(domains), 100):
+        raw = gateway("identify", {"domains": domains[i:i + 100]}).get("raw")
+        for entry in rows_of(raw):
+            m = (entry.get("matches") or [None])[0]
+            url = m and get(m, "company_data.basic_info.professional_network_url", "professional_network_url")
+            if url:
+                out[norm_domain(entry.get("matched_on"))] = (url, get(m, "confidence_score", "confidence"))
+    return out
+
+
+def baseline(domains):
+    out = {}
+    for i in range(0, len(domains), 100):
+        chunk = domains[i:i + 100]
+        sql = "SELECT * FROM companies WHERE normalized_domain IN (%s) LIMIT 5000" % ",".join("'%s'" % d.replace("'", "") for d in chunk)
+        for row in rows_of(gateway("baseline", {"sql": sql}).get("raw"), "rows"):
+            row = {k.lower(): v for k, v in row.items()}
+            d = norm_domain(row.get("normalized_domain") or row.get("domain"))
+            prev = out.get(d)
+            row["_shared"] = (prev["_shared"] if prev else 0) + 1  # hosted-page domains (notion.so, github.io) have many
+            out[d] = row if not prev or (row.get("employee_count") or 0) > (prev.get("employee_count") or 0) else prev | {"_shared": row["_shared"]}
+    return out
+
+
+def enrich_domain(d, titles, base, ident, max_people, mobile=False):
+    global CUR_DOMAIN
+    CUR_DOMAIN = d
+    start = len(SPENT)
+    b = base.get(d) or {}
+    a = {"domain": d, "company_name": b.get("company_name"), "industry": b.get("industry"), "hq": b.get("location"),
+         "employee_count": b.get("employee_count"), "founded_year": b.get("year_founded"), "linkedin_url": b.get("linkedin_url")}
+    a["linkedin_url_source"] = "free_table" if a["linkedin_url"] else None
+    if a["linkedin_url"] and not a["linkedin_url"].startswith("http"):
+        a["linkedin_url"] = "https://www." + a["linkedin_url"].removeprefix("www.")
+
+    mx = mail_gateway(d)  # free DNS, before any paid step: gateway vendor + mailbox provider per company
+    if mx.get("error") or (mx.get("raw") or {}).get("status") != "ok":
+        a["seg_miss_reason"] = mx.get("error") or (mx.get("raw") or {}).get("status") or "no_mx"
+    else:
+        a.update({k: mx["raw"][k] for k in ("seg_vendor", "mailbox_provider", "mx_hosts")})
+
+    resp = gateway("company_search", {"filters": {"field": "basic_info.primary_domain", "type": "=", "value": d}, "limit": 1})
+    rows = rows_of(resp.get("raw"), "companies")
+    c = {}
+    pd = norm_domain(get(rows[0], "basic_info.primary_domain")) if rows else None
+    if resp.get("error") or not rows or pd != d:  # a row for another domain is quarantined: nothing of it (funding, aliases) reaches this account
+        a["company_miss_reason"] = a["funding_miss_reason"] = resp.get("error") or (f"domain_mismatch:{pd}" if rows else "no_company_db_match")
+        rows = []
+    else:
+        c = rows[0]
+        if b.get("_shared", 0) > 5:
+            a["company_miss_reason"] = f"shared_domain:{b['_shared']}_companies"  # data is for *some* company on this host
+        pct = lambda g: round(g, 1) if isinstance(g, (int, float)) else None
+        a.update({k: v for k, v in {
+            "company_name": get(c, "basic_info.name"), "linkedin_url": get(c, "basic_info.professional_network_url"),
+            "linkedin_url_source": "company_db" if get(c, "basic_info.professional_network_url") else None,
+            "website": get(c, "basic_info.website"), "description": get(c, "basic_info.description"),
+            "industry": get(c, "taxonomy.professional_network_industry") or ", ".join(get(c, "basic_info.industries") or []) or None,
+            "categories": ";".join(get(c, "taxonomy.categories") or []) or None, "company_type": get(c, "basic_info.company_type"),
+            "employee_count": get(c, "headcount.total"), "employee_count_range": get(c, "basic_info.employee_count_range"),
+            "headcount_growth_12m_pct": pct(get(c, "headcount.growth_percent.12m")),
+            "hq": get(c, "locations.headquarters"), "country": get(c, "locations.country"), "founded_year": get(c, "basic_info.year_founded"),
+            "revenue_estimate_low_usd": get(c, "revenue.estimated.lower_bound_usd"), "revenue_estimate_high_usd": get(c, "revenue.estimated.upper_bound_usd"),
+            "linkedin_followers": get(c, "followers.count"), "investors": ";".join(get(c, "funding.investors") or []) or None,
+            "funding_total_usd": get(c, "funding.total_investment_usd"), "last_round_type": get(c, "funding.last_round_type"),
+            "last_round_amount_usd": get(c, "funding.last_round_amount_usd"), "last_round_date": get(c, "funding.last_fundraise_date"),
+            "openings_count": get(c, "hiring.openings_count"), "headcount_growth_6m_pct": pct(get(c, "headcount.growth_percent.6m")),
+            "openings_growth_pct": get(c, "hiring.openings_growth_percent.6m", "hiring.openings_growth_percent.3m"),
+            "source_updated_at": (get(c, "metadata.updated_at", "metadata.indexed_at") or "")[:10] or None,
+        }.items() if v is not None})
+        if a.get("openings_count") is None:
+            a["openings_count"] = get(c, "hiring.openings_count")  # keep 0 if it is really 0
+    a["company_source"] = "company_db" if rows else ("free_table" if b else None)
+
+    # funding: the company-search row (free with it, freshest) > funding-rounds lookup by website (0.14 cr, rounds only; its investor attribution is unreliable). A 0 from the first source is a real zero.
+    if a.get("funding_total_usd") is not None:
+        a["funding_source"] = "company_db"
+    else:
+        resp = gateway("funding_rounds", {"website": d, "perPage": 20, "page": 0})  # ponytail: first 20 rounds only; paginate if a company ever has more
+        all_rounds = rows_of(resp.get("raw"), "fundingRounds")
+        rounds = [r for r in all_rounds if r.get("announcedOn")]
+        if all_rounds:
+            known = all(isinstance(r.get("moneyRaised"), (int, float)) for r in all_rounds)  # an undisclosed round (dated or not) makes the total unknown, not smaller
+            a.update({"funding_source": "funding_api", "funding_total_usd": sum(r["moneyRaised"] for r in all_rounds) if known else None})
+            if rounds:  # the latest round needs a date; the total does not
+                last = max(rounds, key=lambda r: r["announcedOn"])
+                a.update({"last_round_type": last.get("stage"), "last_round_amount_usd": last.get("moneyRaised"), "last_round_date": last["announcedOn"][:10]})
+            a.pop("funding_miss_reason", None)
+            if not known:
+                a["funding_miss_reason"] = "undisclosed_amounts"
+            elif len(all_rounds) >= 20:
+                a["funding_miss_reason"] = "possibly_partial:20_rounds"  # a full page says nothing about round 21; the total stands but may be low
+        else:
+            a["funding_miss_reason"] = a.get("funding_miss_reason") or resp.get("error") or "not_available"
+
+    aliases = {norm_domain(x) for x in [a.get("website"), *(get(c, "basic_info.all_domains") or [])]}
+
+    # LinkedIn URL resolution, all free: homepage footer link (company's own claim) > batched identify lookup > paid company-search row > free table
+    if d in ident:
+        a["linkedin_url"], a["linkedin_url_source"] = ident[d][0], f"identify:{ident[d][1]}"
+    site = linkedin_from_site(d)
+    if site.get("slug"):
+        a["linkedin_url"], a["linkedin_url_source"] = f"https://www.linkedin.com/company/{site['slug']}", "homepage"
+
+    # LinkedIn page scrape is the truth for identity/industry/size; the company-search row & free table only fill what it lacks
+    if not a.get("linkedin_url"):
+        a["linkedin_miss_reason"] = "no_linkedin_url"
+    else:
+        resp = scrape_company(a["linkedin_url"])
+        li = (resp.get("items") or [None])[0]
+        if resp.get("error") or not li:
+            a["linkedin_miss_reason"] = resp.get("error") or "no_linkedin_page"
+        else:
+            locs = li.get("locations") or []
+            hq = next((l for l in locs if l.get("headquarter")), locs[0] if locs else {})
+            a.update({k: v for k, v in {
+                "company_source": "linkedin", "company_name": li.get("name"), "website": li.get("website"), "tagline": li.get("tagline"),
+                "description": li.get("description"), "company_type": li.get("companyType"),
+                "industry": "; ".join(i.get("name", "") for i in li.get("industries") or []) or None,
+                "specialities": ";".join(li.get("specialities") or []) or None,
+                "employee_count": li.get("employeeCount"),
+                "employee_count_range": f"{get(li, 'employeeCountRange.start')}-{get(li, 'employeeCountRange.end')}" if get(li, "employeeCountRange.start") else None,
+                "hq": ", ".join(x for x in (hq.get("city"), hq.get("geographicArea"), hq.get("country")) if x) or None,
+                "country": hq.get("country"), "founded_year": get(li, "foundedOn.year"), "linkedin_followers": li.get("followerCount"),
+            }.items() if v is not None})
+
+    resp = tech_lookup(d)
+    t = resp["error"] if resp.get("error") else resp["tech"].get(d, {})
+    if isinstance(t, dict) and t:
+        cut = (time.time() - STALE_TECH_DAYS * 86400) * 1000
+        a["tech_stack"] = ";".join(n for n, ld in t.items() if not ld or ld >= cut) or None
+        a["tech_stale"] = ";".join(n for n, ld in t.items() if ld and ld < cut) or None
+        seen = [ld for ld in t.values() if ld]
+        a["tech_last_detected"] = time.strftime("%Y-%m-%d", time.gmtime(max(seen) / 1000)) if seen else None
+    else:
+        a["tech_miss_reason"] = t if isinstance(t, str) else ("not_available" if t == {} else "no_tech_result")
+
+    if a.get("openings_count") == 0:
+        a["jobs_miss_reason"] = "no_openings"
+    elif not a.get("linkedin_url"):
+        a["jobs_miss_reason"] = "no_linkedin_url"
+    else:
+        resp = scrape_jobs(a["linkedin_url"])
+        if resp.get("error"):
+            a["jobs_miss_reason"] = resp["error"]
+        else:
+            want = a["linkedin_url"].lower().rstrip("/")  # the company's LinkedIn URL is a stronger identity than its website (bit.ly links, legacy domains)
+            items = [j for j in resp["items"] if (get(j, "company.linkedinUrl") or "").lower().rstrip("/") in ("", want)]  # drop wrong-company hits
+            aliases.update(norm_domain(get(j, "company.website")) for j in items if get(j, "company.linkedinUrl"))  # only a verified company's site may seed the people search
+            total = get(items[0], "_meta.pagination.totalElements") if items else None  # true 30-day count for the queried company (same block on every item), read off a verified one
+            if items:  # the provider total is only meaningful when at least one posting is verifiably this company's
+                a["jobs_total"] = total if isinstance(total, int) else len(items)  # integer always (schema column); a capped fetch without the total is a lower bound
+            a["jobs_newest_posted"] = max(((j.get("postedDate") or "")[:10] for j in items), default=None) or None
+            a["job_titles"] = ";".join(dict.fromkeys(j.get("title") for j in items if j.get("title"))) or None  # newest first, up to JOBS_MAX
+            if not items:
+                a["jobs_miss_reason"] = "company_mismatch" if resp["items"] else "no_jobs"
+
+    resp = gateway("titles", {"domain": d})
+    names = [x if isinstance(x, str) else (get(x, "title", "name") or "") for x in rows_of(resp.get("raw"), "titles")]
+    names = sorted({n for n in names if n}, key=lambda n: (not match_titles(n, titles), n))  # target matches first
+    a["titles_at_company"] = ";".join(names[:50]) or None
+    if not names:
+        a["titles_miss_reason"] = resp.get("error") or "no_titles"
+
+    # ponytail: link shorteners would pull people from the shortener's own company; extend the tuple when a new one shows up
+    aliases = sorted(x for x in aliases | {norm_domain(a.get("website"))} if x and x != d and x not in ("bit.ly", "lnkd.in", "linktr.ee", "t.co"))
+    person_key = lambda p: (p.get("linkedinUrl") or "").lower().rstrip("/") or f"{p.get('firstName')}|{p.get('lastName')}".lower()  # URL variants collapse, no-URL people stay distinct
+    uniq, scanned, pstart = {}, 0, len(SPENT)
+    for dom in [d] + aliases:  # alias domains (rebrands, legacy sites) only when nobody is indexed under the input domain; the people search is free
+        for page in (1, 2):
+            resp = gateway("people_search", {"filters": {"companyDomains": [dom], "jobTitles": titles}, "pagination": {"page": page, "limit": 50}})
+            leads = rows_of(resp.get("raw"), "leads")
+            scanned += len(leads)
+            for p in leads:  # the people index holds duplicate records per person; keep the first, count unique people against the limit
+                if match_titles(p.get("title"), titles):
+                    uniq.setdefault(person_key(p), p)
+            if resp.get("error") or len(leads) < 50 or len(uniq) >= max_people:
+                break
+        if scanned or resp.get("error"):
+            break
+    people = list(uniq.values())[:max_people]
+    a["title_matches"] = len(people)
+    if resp.get("error") and scanned == 0:
+        a["people_miss_reason"] = resp["error"]
+    elif scanned == 0:
+        a["people_miss_reason"] = "no_people"
+    elif not people:
+        a["people_miss_reason"] = "no_title_match"
+    rows = [{"domain": d, "company_name": a.get("company_name"), "first_name": p.get("firstName"), "last_name": p.get("lastName"),
+             "title": p.get("title"), "linkedin_url": p.get("linkedinUrl"), "source": "people_db" if dom == d else f"people_db:{dom}",
+             "id": (p.get("linkedinUrl") or "").lower().rstrip("/") or f"{d}|{p.get('firstName')}|{p.get('lastName')}"} for p in people]
+    found_ts = [ts for _, _, _, ts in SPENT[pstart:] if ts]
+    for r in rows:  # email finder: 0.34 cr on a verified hit, free on a miss; keyed by the domain the person was found under (rebrands miss on the input domain)
+        n = len(SPENT)
+        resp = gateway("email_finder", {"first_name": r["first_name"], "last_name": r["last_name"], "domain": dom})
+        em = get(resp, "raw.data") or {}
+        if em.get("email"):
+            r.update(email=em["email"], email_status=em.get("status"), email_catch_all=em.get("is_domain_catch_all", em.get("status") == "valid_catch_all"), email_domain=em["email"].rsplit("@", 1)[-1].lower(), mx_provider=em.get("mx_provider"),
+                     mx_security_gateway=em.get("mx_security_gateway"), mx_gateway_type=em.get("mx_gateway_type"), email_verified_at=(em.get("processed_at") or "")[:10])
+            if em.get("status") not in ("valid", "valid_catch_all"):  # provider enum: valid | valid_catch_all | not_found; anything else is kept but flagged as not outreach-ready
+                r["email_miss_reason"] = f"status_{em.get('status') or 'unknown'}"
+        else:
+            r["email_miss_reason"] = resp.get("error") or "no_email"
+        if mobile:  # --mobile: direct waterfall phone finder, phone only (no email credit), billed on a hit
+            contact = {"first_name": r["first_name"], "last_name": r["last_name"], "company_domain": dom} | ({"linkedin_url": r["linkedin_url"]} if r.get("linkedin_url") else {})
+            resp = phone_finder({"data": [contact], "enrich_email_address": False, "enrich_phone_number": True})
+            row = (rows_of(resp.get("raw"), "data") or [{}])[0] if not resp.get("error") else {}
+            r["mobile_checked"] = bool(row)  # conclusive only when a contact row came back; an error or an empty result leaves the stored mobile columns untouched
+            if row.get("do_not_contact") is not None:
+                r["do_not_contact"] = row["do_not_contact"]  # the opt-out flag stands on its own, number or not
+            if row.get("contact_phone_number"):
+                r.update(mobile=row["contact_phone_number"], mobile_cc=row.get("contact_phone_number_cc"), mobile_status=row.get("contact_phone_number_status"),
+                         mobile_source=row.get("contact_phone_number_provider"))
+            else:
+                r["mobile_miss_reason"] = resp.get("error") or "no_mobile"
+        own_ts = [ts for _, _, _, ts in SPENT[n:] if ts]
+        r["last_enriched_at"] = iso(max(found_ts + own_ts)) if found_ts + own_ts else None  # newest fetch behind this person: their people-search page, email or mobile lookup
+
+    for backend, col in ((BK("gateway"), "gateway_cr"), (BK("scraper"), "scraper_usd"), (BK("tech"), "tech_cr"), (BK("phone"), "phone_cr")):
+        a[col] = round(sum(x for bk, x, _, _ in SPENT[start:] if bk == backend), 4)
+    fetched = [ts for _, _, _, ts in SPENT[start:] if ts] + (BATCH_TS if b or d in ident else [])  # the batched free-table/identify fetches count when the row drew on them
+    a["data_as_of"] = time.strftime("%Y-%m-%d", time.gmtime(min(fetched))) if fetched else None  # oldest response behind this row
+    a["last_enriched_at"] = iso(max(fetched)) if fetched else None  # newest live fetch behind this row; cache-served reruns leave it unchanged
+    CUR_DOMAIN = None
+    return a, rows
+
+
+def write_csvs(accounts, people, out_dir):
+    for name, cols, data in (("accounts.csv", ACCOUNT_COLS, accounts), ("people.csv", PEOPLE_COLS, people)):
+        with open(Path(out_dir) / name, "w", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=cols, restval="", extrasaction="ignore")
+            w.writeheader()
+            w.writerows(data)
+
+
+def main():
+    global DRY, MAX_AGE_DAYS
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument("--input", required=True, help="CSV with a 'domain' column")
+    ap.add_argument("--titles", required=True, help='comma-separated title substrings, e.g. "VP Sales,Head of RevOps"')
+    ap.add_argument("--limit", type=int, help="only the first N domains")
+    ap.add_argument("--max-people", type=int, default=5)
+    ap.add_argument("--mobile", action="store_true", help="also look up a mobile number per contact (paid on a hit, off by default)")
+    ap.add_argument("--dry-run", action="store_true", help="plan calls, touch no network")
+    ap.add_argument("--max-age", type=int, metavar="DAYS", help="re-fetch cached responses older than DAYS (re-bills only those); default: cache never expires")
+    ap.add_argument("--out-dir", default=".")
+    ap.add_argument("--no-db", action="store_true", help="skip the Supabase upsert even when keys are set")
+    args = ap.parse_args()
+    DRY, MAX_AGE_DAYS = args.dry_run, args.max_age
+    titles = [t.strip() for t in args.titles.split(",") if t.strip()]
+    with open(args.input, newline="") as f:
+        reader = csv.DictReader(f)
+        if "domain" not in (reader.fieldnames or []):
+            sys.exit(f"{args.input}: no 'domain' column (found: {', '.join(reader.fieldnames or [])})")
+        domains = [norm_domain(r.get("domain")) for r in reader]
+    domains = list(dict.fromkeys(d for d in domains if d))[: args.limit]
+    if not domains or not titles or args.max_people < 1 or (args.limit or 1) < 1 or (args.max_age or 0) < 0:  # fail before any network call or output file is touched
+        sys.exit("nothing to do: need at least one domain, one title, --max-people >= 1, --limit >= 1, --max-age >= 0")
+    Path(args.out_dir).mkdir(parents=True, exist_ok=True)
+    load_cache()
+
+    base = baseline(domains)
+    ident = identify(domains)
+    BATCH_TS[:] = [ts for _, _, _, ts in SPENT if ts]
+
+    accounts, people = [], []
+    for d in domains:
+        try:
+            a, ps = enrich_domain(d, titles, base, ident, args.max_people, args.mobile)
+        except Exception as e:  # one bad provider payload must not lose the domains already enriched
+            print(f"{d}: failed with {type(e).__name__}: {str(e)[:200]}", file=sys.stderr)
+            a, ps = {"domain": d, "company_miss_reason": f"exception:{type(e).__name__}", "title_matches": 0}, []
+        accounts.append(a)
+        people += ps
+        print(f"{d}: {a.get('company_name') or '-'} | openings={a.get('openings_count')} | jobs={a.get('jobs_total')} | people={a['title_matches']}", file=sys.stderr)
+
+    if DRY:
+        print(f"DRY RUN: {len(domains)} domains, {len(PLANNED)} network calls planned (cached ones excluded):", file=sys.stderr)
+        for p in sorted(set(PLANNED)):
+            print(f"  {p} x{PLANNED.count(p)}", file=sys.stderr)
+        print(f"Estimate per domain: <=0.02 gateway cr (+0.14 funding fallback when the company record has no funding block) + <=${0.001 * (JOBS_MAX + 1):.3f} scraper ({JOBS_MAX} jobs) + ~1 tech-lookup credit + 0.34 cr per verified email (<= --max-people){' + 10 phone-finder credits per mobile found' if args.mobile else ''}", file=sys.stderr)
+        return
+    write_csvs(accounts, people, args.out_dir)
+    dl = sum(x for bk, x, c, _ in SPENT if bk == BK("gateway") and not c)
+    ap_usd = sum(x for bk, x, c, _ in SPENT if bk == BK("scraper") and not c)
+    bw = sum(x for bk, x, c, _ in SPENT if bk == BK("tech") and not c)
+    bc = sum(x for bk, x, c, _ in SPENT if bk == BK("phone") and not c)
+    db = "off" if args.no_db or not (SB_URL and SB_KEY) else db_write(accounts, people, RUN_ID, args.mobile)
+    print(f"Wrote accounts.csv ({len(accounts)}) and people.csv ({len(people)}). "
+          f"Run cost: gateway {dl:.2f} cr | scraper ${ap_usd:.3f} | tech {bw:.2f} cr | phone {bc:.0f} cr | {sum(1 for _, _, c, _ in SPENT if c)} cached calls | db: {db}", file=sys.stderr)
+
+
+if __name__ == "__main__":
+    main()

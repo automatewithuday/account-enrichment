@@ -1,0 +1,11 @@
+.env
+.cache/
+*.csv
+!sample.csv
+.venv/
+__pycache__/
+# internal agent config and operating notes, not part of the pipeline
+CLAUDE.md
+.claude/
+# provider routing (backend labels, tool ids, endpoints) — deployment config, stays local
+providers.json
